@@ -74,6 +74,13 @@ ICMPV6_TYPE_NAMES = {
 # distinguishable failures.
 DEFAULT_TARGETS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "one.one.one.one"]
 
+# IPv6 probe target (Cloudflare's resolver).
+IPV6_TARGET = "2606:4700:4700::1111"
+
+# A copy of ping carrying the cap_net_raw file capability, created by the
+# Dockerfile. It demonstrates the workaround for images that run as non-root.
+PING_WITH_FILECAP = "/usr/local/bin/ping-filecap"
+
 # The uid/gid the "unprivileged" variants run as (nobody/nogroup on Debian).
 UNPRIV_UID = 65534
 UNPRIV_GID = 65534
@@ -168,6 +175,7 @@ class ProbeResult:
     name: str
     ok: bool
     detail: str
+    target: str = ""
     replies: list[dict[str, Any]] = field(default_factory=list)
     rtt_ms: list[float] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -175,6 +183,7 @@ class ProbeResult:
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
+            "target": self.target,
             "ok": self.ok,
             "detail": self.detail,
             "replies": self.replies,
@@ -203,12 +212,17 @@ def socket_probe(
     payload_size: int = 32,
     ttl: int | None = None,
     v6: bool = False,
+    expect: str = "echo",
 ) -> ProbeResult:
     """Send echo requests over a Python socket and collect the replies.
 
     ``mode`` is "dgram" for an ICMP datagram (ping) socket -- allowed without
     CAP_NET_RAW when the caller's gid is inside net.ipv4.ping_group_range -- or
     "raw" for SOCK_RAW, which requires CAP_NET_RAW.
+
+    ``expect`` selects the success condition: "echo" means an echo reply came
+    back; "error" means a non-echo ICMP message (e.g. time-exceeded) came back,
+    which is what a TTL-limited probe is looking for.
     """
     label = f"{mode}-socket{'-v6' if v6 else ''}"
     if ttl is not None:
@@ -216,7 +230,7 @@ def socket_probe(
 
     addr, err = resolve(target, v6)
     if addr is None:
-        return ProbeResult(label, False, err)
+        return ProbeResult(label, False, err, target=target)
 
     family = socket.AF_INET6 if v6 else socket.AF_INET
     proto = socket.IPPROTO_ICMPV6 if v6 else socket.IPPROTO_ICMP
@@ -232,10 +246,11 @@ def socket_probe(
             f"{'SOCK_DGRAM' if mode == 'dgram' else 'SOCK_RAW'}, "
             f"{'IPPROTO_ICMPV6' if v6 else 'IPPROTO_ICMP'}) failed: "
             f"[errno {exc.errno}] {exc.strerror}",
+            target=target,
             extra={"errno": exc.errno, "resolved": addr},
         )
 
-    result = ProbeResult(label, False, "", extra={"resolved": addr})
+    result = ProbeResult(label, False, "", target=target, extra={"resolved": addr})
     try:
         if ttl is not None:
             if v6:
@@ -292,11 +307,20 @@ def socket_probe(
             for r in result.replies
             if r.get("type") == (ICMPV6_ECHO_REPLY if v6 else ICMP_ECHO_REPLY)
         )
-        result.ok = echo_replies > 0
-        parts = [f"sent {sent}/{count}", f"echo replies {echo_replies}"]
         other = len(result.replies) - echo_replies
+        result.ok = other > 0 if expect == "error" else echo_replies > 0
+        result.extra["echo_replies"] = echo_replies
+        result.extra["non_echo_icmp"] = other
+        parts = [f"sent {sent}/{count}", f"echo replies {echo_replies}"]
         if other:
-            parts.append(f"other ICMP {other}")
+            parts.append(
+                "other ICMP: "
+                + ", ".join(
+                    sorted({str(r.get("type_name")) for r in result.replies if r.get("type") != (ICMPV6_ECHO_REPLY if v6 else ICMP_ECHO_REPLY)})
+                )
+            )
+        if expect == "error" and not other and echo_replies:
+            parts.append("TTL ignored: got an echo reply instead of time-exceeded")
         if result.rtt_ms:
             parts.append(f"avg {sum(result.rtt_ms) / len(result.rtt_ms):.2f} ms")
         if errors:
@@ -325,11 +349,25 @@ def run_cmd(cmd: list[str], timeout: float = 25.0) -> dict[str, Any]:
 
 
 def ping_binary_probe(
-    target: str, *, count: int = 3, v6: bool = False, unprivileged: bool = False
+    target: str,
+    *,
+    count: int = 3,
+    v6: bool = False,
+    unprivileged: bool = False,
+    binary: str = "ping",
 ) -> ProbeResult:
-    """Run the system ``ping``, optionally after dropping to an unprivileged uid."""
-    label = f"ping-binary{'-v6' if v6 else ''}{'-unprivileged' if unprivileged else ''}"
-    cmd = ["ping", "-n", "-c", str(count), "-W", "2", "-i", "0.3"]
+    """Run a ``ping`` binary, optionally after dropping to an unprivileged uid.
+
+    ``binary`` allows probing a copy of ping that carries the cap_net_raw file
+    capability (see the Dockerfile), which is the standard workaround for images
+    that run as a non-root user.
+    """
+    suffix = "" if binary == "ping" else f"-{os.path.basename(binary)}"
+    label = (
+        f"ping-binary{suffix}{'-v6' if v6 else ''}"
+        f"{'-unprivileged' if unprivileged else ''}"
+    )
+    cmd = [binary, "-n", "-c", str(count), "-W", "2", "-i", "0.3"]
     cmd.append("-6" if v6 else "-4")
     cmd.append(target)
     if unprivileged:
@@ -344,7 +382,7 @@ def ping_binary_probe(
     detail = info.get("error") or (info.get("stdout") or "").splitlines()
     if isinstance(detail, list):
         detail = " | ".join(detail[-3:]) if detail else (info.get("stderr") or "no output")
-    return ProbeResult(label, ok, str(detail), extra=info)
+    return ProbeResult(label, ok, str(detail), target=target, extra=info)
 
 
 def unprivileged_socket_probe(target: str, *, mode: str, count: int = 3) -> ProbeResult:
@@ -377,16 +415,20 @@ def unprivileged_socket_probe(target: str, *, mode: str, count: int = 3) -> Prob
             label,
             False,
             info.get("error") or info.get("stderr") or "child failed",
+            target=target,
             extra=info,
         )
     try:
         payload = json.loads(info["stdout"])
     except (json.JSONDecodeError, KeyError) as exc:
-        return ProbeResult(label, False, f"could not parse child output: {exc}", extra=info)
+        return ProbeResult(
+            label, False, f"could not parse child output: {exc}", target=target, extra=info
+        )
     return ProbeResult(
         label,
         bool(payload.get("ok")),
         str(payload.get("detail", "")),
+        target=target,
         replies=payload.get("replies", []),
         rtt_ms=payload.get("rtt_ms", []),
         extra={"child_uid": UNPRIV_UID, "child_gid": UNPRIV_GID},
@@ -500,7 +542,9 @@ def environment() -> dict[str, Any]:
         "capsh": run_cmd(["capsh", "--print"]).get("stdout", ""),
         "ping_group_range": read_file("/proc/sys/net/ipv4/ping_group_range"),
         "ip_unprivileged_port_start": read_file("/proc/sys/net/ipv4/ip_unprivileged_port_start"),
-        "getcap_ping": run_cmd(["getcap", "-r", "/usr/bin/ping", "/bin/ping"]).get("stdout", ""),
+        "getcap_ping": run_cmd(
+            ["getcap", "-r", "/usr/bin/ping", "/bin/ping", PING_WITH_FILECAP]
+        ).get("stdout", ""),
         "ip_addr": run_cmd(["ip", "-o", "addr"]).get("stdout", ""),
         "ip_route": run_cmd(["ip", "route"]).get("stdout", ""),
         "resolv_conf": read_file("/etc/resolv.conf"),
@@ -532,61 +576,173 @@ def suite(targets: list[str] | None = None, *, count: int = 3) -> dict[str, Any]
     results.append(unprivileged_socket_probe(primary, mode="dgram", count=count))
     results.append(unprivileged_socket_probe(primary, mode="raw", count=count))
     results.append(ping_binary_probe(primary, count=count, unprivileged=True))
+    # ...and the workaround: a ping binary carrying cap_net_raw+ep, which works
+    # for a non-root uid because CAP_NET_RAW is still in the bounding set.
+    if os.path.exists(PING_WITH_FILECAP):
+        results.append(
+            ping_binary_probe(
+                primary, count=count, unprivileged=True, binary=PING_WITH_FILECAP
+            )
+        )
 
     # 3. IPv6.
-    results.append(socket_probe("2606:4700:4700::1111", mode="dgram", count=count, v6=True))
-    results.append(socket_probe("2606:4700:4700::1111", mode="raw", count=count, v6=True))
-    results.append(ping_binary_probe("2606:4700:4700::1111", count=count, v6=True))
+    results.append(socket_probe(IPV6_TARGET, mode="dgram", count=count, v6=True))
+    results.append(socket_probe(IPV6_TARGET, mode="raw", count=count, v6=True))
+    results.append(ping_binary_probe(IPV6_TARGET, count=count, v6=True))
 
     # 4. Non-echo ICMP: a TTL-limited echo should draw a time-exceeded from the
-    #    first hop. If nothing comes back, ICMP error messages are not being
-    #    delivered into the namespace (no traceroute, no PMTU feedback).
-    results.append(socket_probe(primary, mode="dgram", count=1, ttl=1, timeout=4.0))
-    results.append(socket_probe(primary, mode="raw", count=1, ttl=1, timeout=4.0))
+    #    first hop. If an echo *reply* comes back instead, the TTL was ignored,
+    #    which means something is terminating/proxying ICMP rather than routing
+    #    the app's packets (pasta translates echo requests into host ping
+    #    sockets). Either way, no ICMP error means no traceroute and no PMTU
+    #    feedback for the app.
     results.append(
-        ProbeResult(
-            "ping-binary-ttl1",
-            False,
-            "",
-            extra=run_cmd(["ping", "-n", "-c", "1", "-W", "3", "-t", "1", primary]),
-        )
+        socket_probe(primary, mode="dgram", count=1, ttl=1, timeout=4.0, expect="error")
     )
-    ttl_info = results[-1].extra
-    ttl_out = (ttl_info.get("stdout", "") or "") + (ttl_info.get("stderr", "") or "")
-    results[-1].ok = "Time to live exceeded" in ttl_out or "exceeded" in ttl_out.lower()
-    results[-1].detail = " | ".join(ttl_out.splitlines()[:4]) or ttl_info.get("error", "no output")
+    results.append(
+        socket_probe(primary, mode="raw", count=1, ttl=1, timeout=4.0, expect="error")
+    )
+    ttl_binary = ProbeResult(
+        "ping-binary-ttl1",
+        False,
+        "",
+        target=primary,
+        extra=run_cmd(["ping", "-n", "-c", "1", "-W", "3", "-t", "1", primary]),
+    )
+    ttl_out = (ttl_binary.extra.get("stdout", "") or "") + (
+        ttl_binary.extra.get("stderr", "") or ""
+    )
+    ttl_binary.ok = "exceeded" in ttl_out.lower()
+    if not ttl_binary.ok and "bytes from" in ttl_out:
+        ttl_binary.detail = "TTL ignored: echo reply came back for a TTL=1 probe"
+    else:
+        ttl_binary.detail = " | ".join(ttl_out.splitlines()[:4]) or ttl_binary.extra.get(
+            "error", "no output"
+        )
+    results.append(ttl_binary)
 
-    # 5. Unreachable-port ICMP: a UDP probe to a closed port on a live host
-    #    should draw destination-unreachable.
-    results.append(
-        ProbeResult(
-            "traceroute-icmp",
-            False,
-            "",
-            extra=run_cmd(["traceroute", "-I", "-n", "-m", "4", "-w", "2", primary], timeout=30),
-        )
+    # 5. traceroute: reveals whether intermediate hops are visible at all.
+    trace = ProbeResult(
+        "traceroute-icmp",
+        False,
+        "",
+        target=primary,
+        extra=run_cmd(["traceroute", "-I", "-n", "-m", "4", "-w", "2", primary], timeout=30),
     )
-    tr_info = results[-1].extra
-    tr_out = tr_info.get("stdout", "") or ""
-    # A hop line that is not all stars means ICMP replies/errors made it back.
+    tr_out = trace.extra.get("stdout", "") or ""
     hop_lines = [ln for ln in tr_out.splitlines()[1:] if ln.strip()]
-    results[-1].ok = any("* * *" not in ln for ln in hop_lines)
-    results[-1].detail = " | ".join(hop_lines[:6]) or tr_info.get("error", "no output")
+    resolved_primary = resolve(primary, False)[0] or primary
+    intermediate = [
+        ln for ln in hop_lines if "*" not in ln and resolved_primary not in ln
+    ]
+    # Success means real hops were seen. A single hop that is already the target
+    # means ICMP is proxied and the path is invisible.
+    trace.ok = bool(intermediate)
+    trace.detail = (" | ".join(hop_lines[:6]) or trace.extra.get("error", "no output")) + (
+        "" if intermediate else "  [no intermediate hops visible]"
+    )
+    results.append(trace)
 
-    outbound = [r for r in results if r.name.startswith(("dgram", "raw", "ping-binary")) and "ttl" not in r.name]
+    sniffer = SNIFFER.snapshot()
+    outbound_privileged = [
+        r
+        for r in results
+        if r.name in ("dgram-socket", "raw-socket", "ping-binary", "dgram-socket-v6",
+                      "raw-socket-v6", "ping-binary-v6")
+    ]
+    unprivileged = [r for r in results if "unprivileged" in r.name]
+    ttl_probes = [r for r in results if "ttl1" in r.name]
     return {
         "generated_at": time.time(),
         "verdict": {
-            "outbound_echo_works": any(r.ok for r in outbound),
-            "outbound_echo_works_unprivileged": any(
-                r.ok for r in results if "unprivileged" in r.name
+            "outbound_echo_works": any(r.ok for r in outbound_privileged),
+            "outbound_echo_works_unprivileged": any(r.ok for r in unprivileged),
+            "icmp_errors_delivered": any(r.ok for r in ttl_probes) or bool(
+                [
+                    p
+                    for p in sniffer["recent"]
+                    if p.get("type") not in (0, 8, 128, 129)
+                ]
             ),
-            "icmp_errors_delivered": any(r.ok for r in results if "ttl" in r.name or r.name == "traceroute-icmp"),
-            "inbound_echo_requests_seen": SNIFFER.snapshot()["inbound_echo_requests"],
+            "ttl_respected": any(r.ok for r in ttl_probes),
+            "path_visible_to_traceroute": any(
+                r.ok for r in results if r.name == "traceroute-icmp"
+            ),
+            "inbound_echo_requests_seen": sniffer["inbound_echo_requests"],
         },
         "probes": [r.as_dict() for r in results],
-        "sniffer": SNIFFER.snapshot(),
+        "sniffer": sniffer,
         "environment": environment(),
+    }
+
+
+# A cached suite result. The platform's readiness probe polls the app's root
+# path frequently, and a full run takes tens of seconds and emits real network
+# traffic, so runs are rate-limited and served from cache.
+SUITE_TTL_SECONDS = 60.0
+_suite_lock = threading.Lock()
+_suite_state: dict[str, Any] = {"data": None, "at": 0.0, "running": False}
+_suite_done = threading.Event()
+
+
+def _refresh_suite(count: int, targets: list[str] | None) -> None:
+    try:
+        data = suite(targets, count=count)
+        with _suite_lock:
+            _suite_state["data"] = data
+            _suite_state["at"] = time.time()
+    finally:
+        with _suite_lock:
+            _suite_state["running"] = False
+        _suite_done.set()
+
+
+def cached_suite(
+    *, count: int = 3, targets: list[str] | None = None, wait: bool = False
+) -> dict[str, Any]:
+    """Return the most recent suite result, refreshing it at most once a minute.
+
+    Never blocks unless ``wait`` is set, so the readiness probe stays fast while
+    a run is in flight.
+    """
+    now = time.time()
+    with _suite_lock:
+        data = _suite_state["data"]
+        age = now - _suite_state["at"] if data else None
+        fresh = data is not None and age is not None and age < SUITE_TTL_SECONDS
+        if not fresh and not _suite_state["running"]:
+            _suite_state["running"] = True
+            _suite_done.clear()
+            threading.Thread(
+                target=_refresh_suite, args=(count, targets), daemon=True
+            ).start()
+        running = _suite_state["running"]
+
+    if wait and running:
+        _suite_done.wait(timeout=300)
+        with _suite_lock:
+            data = _suite_state["data"]
+            age = time.time() - _suite_state["at"] if data else None
+            running = _suite_state["running"]
+
+    if data is None:
+        return {
+            "status": "running",
+            "message": "first probe run in progress; retry in a few seconds",
+            "sniffer": SNIFFER.snapshot(),
+            "environment": environment(),
+        }
+
+    live_sniffer = SNIFFER.snapshot()
+    return {
+        **data,
+        "status": "running" if running else "ready",
+        "age_s": round(age or 0.0, 1),
+        "sniffer": live_sniffer,
+        "verdict": {
+            **data["verdict"],
+            "inbound_echo_requests_seen": live_sniffer["inbound_echo_requests"],
+        },
     }
 
 
@@ -604,11 +760,19 @@ th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #dd
 .ok { color: #0a7d28; font-weight: bold; } .bad { color: #b00020; font-weight: bold; }
 pre { background: #f5f5f5; padding: 0.75rem; overflow-x: auto; font-size: 0.78rem; }
 .verdict { padding: 0.75rem 1rem; background: #f0f4ff; border-left: 4px solid #3355cc; }
+.meta { color: #555; font-size: 0.8rem; }
 a { color: #3355cc; }
 """
 
 
 def render_html(data: dict[str, Any]) -> str:
+    if data.get("verdict") is None:
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<title>icmp-test</title><style>{PAGE_CSS}</style></head>
+<body><h1>icmp-test</h1><p>{html.escape(str(data.get("message", "running probes...")))}</p>
+<p>This page refreshes automatically.</p></body></html>"""
+
     verdict = data["verdict"]
 
     def mark(value: bool) -> str:
@@ -617,8 +781,9 @@ def render_html(data: dict[str, Any]) -> str:
     rows = []
     for probe in data["probes"]:
         rows.append(
-            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
                 html.escape(probe["name"]),
+                html.escape(probe.get("target", "")),
                 mark(probe["ok"]),
                 html.escape(probe["detail"])[:400],
             )
@@ -629,22 +794,34 @@ def render_html(data: dict[str, Any]) -> str:
 <body>
 <h1>icmp-test &mdash; can this app use ICMP?</h1>
 <div class="verdict">
-<p>Outbound ICMP echo (as the container user): {mark(verdict["outbound_echo_works"])}</p>
-<p>Outbound ICMP echo as an unprivileged uid/gid: {mark(verdict["outbound_echo_works_unprivileged"])}</p>
-<p>Non-echo ICMP (errors, traceroute) delivered: {mark(verdict["icmp_errors_delivered"])}</p>
-<p>Inbound echo requests observed by the sniffer: <b>{verdict["inbound_echo_requests_seen"]}</b>
+<p>Outbound ICMP echo, as the container's own user: {mark(verdict["outbound_echo_works"])}</p>
+<p>Outbound ICMP echo, as an unprivileged uid/gid: {mark(verdict["outbound_echo_works_unprivileged"])}</p>
+<p>TTL respected (a TTL=1 probe drew a time-exceeded): {mark(verdict["ttl_respected"])}</p>
+<p>Non-echo ICMP delivered to the app: {mark(verdict["icmp_errors_delivered"])}</p>
+<p>Intermediate hops visible to traceroute: {mark(verdict["path_visible_to_traceroute"])}</p>
+<p>Inbound echo <em>requests</em> observed by the sniffer:
+<b>{verdict["inbound_echo_requests_seen"]}</b>
 (sniffer up {sniff["uptime_s"]}s, {sniff["packets_seen"]} ICMP packets seen in total)</p>
 </div>
+<p class="meta">Results are cached for up to {int(SUITE_TTL_SECONDS)}s
+(this run is {data.get("age_s", 0)}s old, state: {html.escape(str(data.get("status", "")))}).
+Force a fresh run: <a href="/?run=1">/?run=1</a></p>
 <h2>Probes</h2>
-<table><tr><th>probe</th><th>ok</th><th>detail</th></tr>{"".join(rows)}</table>
-<h2>Sniffer (inbound ICMP into this container's netns)</h2>
+<table><tr><th>probe</th><th>target</th><th>ok</th><th>detail</th></tr>{"".join(rows)}</table>
+<h2>Sniffer (ICMP delivered into this container's netns)</h2>
+<p class="meta">To test the inbound direction, ping this instance's public IP from
+another machine and then reload: any echo <em>request</em> here means outside
+traffic reached the app.</p>
 <pre>{html.escape(json.dumps(sniff, indent=2))}</pre>
 <h2>Environment</h2>
 <pre>{html.escape(json.dumps(data["environment"], indent=2))}</pre>
 <h2>JSON endpoints</h2>
 <ul>
-<li><a href="/api/suite">/api/suite</a> &mdash; everything above as JSON</li>
-<li><a href="/api/ping?target=1.1.1.1&amp;mode=dgram">/api/ping?target=&amp;mode=dgram|raw|binary&amp;count=&amp;ttl=&amp;v6=1</a></li>
+<li><a href="/api/suite">/api/suite</a> &mdash; everything above as JSON
+(<code>?wait=1</code> blocks for a fresh run, <code>?run=1</code> forces one,
+<code>?count=N</code>, <code>?targets=a,b</code>)</li>
+<li><a href="/api/ping?target=1.1.1.1&amp;mode=dgram">/api/ping</a>
+&mdash; <code>?target=&amp;mode=dgram|raw|binary|dgram-unprivileged|raw-unprivileged|binary-unprivileged&amp;count=&amp;ttl=&amp;v6=1</code></li>
 <li><a href="/api/sniffer">/api/sniffer</a> &mdash; inbound ICMP seen so far</li>
 <li><a href="/api/env">/api/env</a> &mdash; caps, sysctls, interfaces</li>
 <li><a href="/health">/health</a></li>
@@ -704,13 +881,24 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "binary":
                 result = ping_binary_probe(target, count=count, v6=v6)
             elif mode in ("dgram", "raw"):
-                result = socket_probe(target, mode=mode, count=count, ttl=ttl, v6=v6)
+                expect = "error" if ttl is not None else "echo"
+                result = socket_probe(
+                    target, mode=mode, count=count, ttl=ttl, v6=v6, expect=expect
+                )
             elif mode in ("dgram-unprivileged", "raw-unprivileged"):
                 result = unprivileged_socket_probe(
                     target, mode=mode.split("-")[0], count=count
                 )
             elif mode == "binary-unprivileged":
                 result = ping_binary_probe(target, count=count, v6=v6, unprivileged=True)
+            elif mode == "binary-filecap-unprivileged":
+                result = ping_binary_probe(
+                    target,
+                    count=count,
+                    v6=v6,
+                    unprivileged=True,
+                    binary=PING_WITH_FILECAP,
+                )
             else:
                 self._json({"error": f"unknown mode: {mode}"}, 400)
                 return
@@ -724,7 +912,12 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json({"error": "count must be an integer"}, 400)
                 return
-            data = suite(targets, count=count)
+            force = arg("run", "0") not in ("0", "", "false")
+            wait = force or arg("wait", "0") not in ("0", "", "false")
+            if force:
+                with _suite_lock:
+                    _suite_state["at"] = 0.0
+            data = cached_suite(count=count, targets=targets, wait=wait)
             if path == "/":
                 self._send(200, render_html(data).encode(), "text/html; charset=utf-8")
             else:
@@ -745,7 +938,12 @@ def main() -> int:
 
     if args.probe:
         result = socket_probe(
-            args.target, mode=args.mode, count=args.count, ttl=args.ttl, v6=args.v6
+            args.target,
+            mode=args.mode,
+            count=args.count,
+            ttl=args.ttl,
+            v6=args.v6,
+            expect="error" if args.ttl is not None else "echo",
         )
         print(json.dumps(result.as_dict()))
         return 0
