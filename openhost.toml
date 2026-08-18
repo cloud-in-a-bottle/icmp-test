@@ -1,0 +1,18 @@
+[app]
+name = "icmp-test"
+version = "0.1.0"
+description = "Diagnostic app that probes whether a Cloud in a Bottle app can send and receive ICMP echo (ping) packets."
+
+[runtime.container]
+image = "Dockerfile"
+port = 5000
+
+[routing]
+health_check = "/health"
+
+[resources]
+memory_mb = 256
+cpu_cores = 0.5
+
+[data]
+app_data = false
